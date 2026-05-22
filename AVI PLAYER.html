@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>AVI Player</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        /* === БАЗОВЫЕ СТИЛИ === */
+        body {
+            background-color: #0f0f1a;
+            color: #bbdefb;
+            font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+        
+        h2 { 
+            font-weight: 300; 
+            letter-spacing: 2px; 
+            margin-top: 20px; 
+        }
+
+        /* === КОНТЕЙНЕР ПЛЕЕРА === */
+        #player-wrapper {
+            position: relative;
+            width: 100%;
+            max-width: 1000px;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 15px 40px rgba(0,0,0,0.8);
+            margin-top: 20px;
+            /* Убираем выделение текста при двойных кликах */
+            user-select: none; 
+            -webkit-user-select: none;
+        }
+
+        /* Само видео (без стандартных контролов) */
+        video {
+            width: 100%;
+            display: block;
+            cursor: pointer;
+        }
+
+        /* === КАСТОМНАЯ ПАНЕЛЬ УПРАВЛЕНИЯ (Glassmorphism) === */
+        #custom-controls {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            background: rgba(15, 15, 26, 0.85);
+            padding: 15px 20px;
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            transform: translateY(100%);
+            transition: transform 0.3s ease;
+            /* Фолбэк для старых браузеров без поддержки blur */
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+
+        /* Поддержка блюра для современных браузеров */
+        @supports (backdrop-filter: blur(10px)) {
+            #custom-controls { backdrop-filter: blur(10px); }
+        }
+
+        /* Показываем панель при наведении на плеер или на паузе */
+        #player-wrapper:hover #custom-controls,
+        #player-wrapper.paused #custom-controls {
+            transform: translateY(0);
+        }
+
+        /* Кнопки управления */
+        .ctrl-btn {
+            background: none;
+            border: none;
+            color: #fff;
+            font-size: 20px;
+            cursor: pointer;
+            outline: none;
+            transition: color 0.2s;
+            padding: 0;
+            width: 30px;
+        }
+        .ctrl-btn:hover { color: #2196f3; }
+
+        /* Прогресс-бар */
+        #progress-container {
+            flex-grow: 1;
+            height: 6px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 3px;
+            cursor: pointer;
+            position: relative;
+        }
+        #progress-fill {
+            position: absolute;
+            top: 0; left: 0; height: 100%;
+            background: #2196f3;
+            border-radius: 3px;
+            width: 0%;
+            pointer-events: none;
+        }
+
+        /* Таймер */
+        #time-display {
+            font-size: 13px;
+            color: #ddd;
+            min-width: 100px;
+            text-align: center;
+        }
+
+        /* === ИНДИКАТОРЫ ДВОЙНОГО ТАПА (ПЕРЕМОТКИ) === */
+        .tap-indicator {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            color: white;
+            font-size: 24px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px 25px;
+            border-radius: 30px;
+            opacity: 0;
+            pointer-events: none;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            /* Фолбэк */
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        @supports (backdrop-filter: blur(5px)) {
+            .tap-indicator { backdrop-filter: blur(5px); }
+        }
+
+        .tap-indicator.left { left: 10%; }
+        .tap-indicator.right { right: 10%; }
+
+        /* Анимация вспышки индикатора */
+        .tap-indicator.pulse {
+            animation: tapPulse 0.5s ease-out forwards;
+        }
+        @keyframes tapPulse {
+            0% { transform: translateY(-50%) scale(0.8); opacity: 1; }
+            100% { transform: translateY(-50%) scale(1.2); opacity: 0; }
+        }
+
+        /* Статусные сообщения */
+        #status-msg { margin-top: 15px; color: #888; font-size: 14px; text-align: center; }
+        .error { color: #f44336 !important; }
+    </style>
+</head>
+<body>
+
+    <h2><i class="fas fa-play-circle" style="color: #2196f3;"></i> AVI Player</h2>
+    
+    <div id="player-wrapper" class="paused">
+        <video id="video"></video>
+        
+        <div id="tap-left" class="tap-indicator left"><i class="fas fa-backward"></i> 5 сек</div>
+        <div id="tap-right" class="tap-indicator right">5 сек <i class="fas fa-forward"></i></div>
+        
+        <div id="custom-controls">
+            <button id="play-pause-btn" class="ctrl-btn" title="Play/Pause (Space)">
+                <i class="fas fa-play"></i>
+            </button>
+            
+            <div id="progress-container">
+                <div id="progress-fill"></div>
+            </div>
+            
+            <div id="time-display">00:00 / 00:00</div>
+            
+            <button id="mute-btn" class="ctrl-btn" title="Mute (M)">
+                <i class="fas fa-volume-up"></i>
+            </button>
+            
+            <button id="fullscreen-btn" class="ctrl-btn" title="Fullscreen (F)">
+                <i class="fas fa-expand"></i>
+            </button>
+        </div>
+    </div>
+
+    <div id="status-msg">Инициализация плеера...</div>
+
+    <script>
+        // === 1. ЛОГИКА ЗАГРУЗКИ ПОТОКА (HLS) ===
+        function getQueryParam(name) {
+            var match = RegExp('[?&]' + name + '=([^&]*)').exec(window.location.search);
+            return match && decodeURIComponent(match[1].replace(/\+/g, ' '));
+        }
+
+        var streamUrl = getQueryParam('stream');
+        var video = document.getElementById('video');
+        var statusMsg = document.getElementById('status-msg');
+
+        if (!streamUrl) {
+            statusMsg.className = 'error';
+            statusMsg.innerHTML = 'URL потока не найден. Запустите видео с главного сервера.';
+        } else {
+            if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+                var hls = new Hls({ debug: false });
+                hls.loadSource(streamUrl);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    statusMsg.innerHTML = 'Поток готов! Нажмите Play.';
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                // Поддержка Safari / iOS
+                video.src = streamUrl;
+                statusMsg.innerHTML = 'Поток готов (Нативный HLS).';
+            } else {
+                statusMsg.className = 'error';
+                statusMsg.innerHTML = 'Ваш браузер слишком стар для стриминга (Нет поддержки MSE).';
+            }
+        }
+
+        // === 2. ЭЛЕМЕНТЫ ИНТЕРФЕЙСА ===
+        var wrapper = document.getElementById('player-wrapper');
+        var playBtn = document.getElementById('play-pause-btn');
+        var muteBtn = document.getElementById('mute-btn');
+        var fullBtn = document.getElementById('fullscreen-btn');
+        var progressContainer = document.getElementById('progress-container');
+        var progressFill = document.getElementById('progress-fill');
+        var timeDisplay = document.getElementById('time-display');
+        var tapLeftInd = document.getElementById('tap-left');
+        var tapRightInd = document.getElementById('tap-right');
+
+        // Форматирование времени (секунды -> ММ:СС)
+        function formatTime(seconds) {
+            if (isNaN(seconds)) return "00:00";
+            var m = Math.floor(seconds / 60);
+            var s = Math.floor(seconds % 60);
+            return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+        }
+
+        // === 3. БАЗОВЫЕ ФУНКЦИИ УПРАВЛЕНИЯ ===
+        function togglePlay() {
+            if (video.paused) {
+                video.play();
+                playBtn.innerHTML = '<i class="fas fa-pause"></i>';
+                wrapper.classList.remove('paused');
+            } else {
+                video.pause();
+                playBtn.innerHTML = '<i class="fas fa-play"></i>';
+                wrapper.classList.add('paused');
+            }
+        }
+
+        function toggleMute() {
+            video.muted = !video.muted;
+            muteBtn.innerHTML = video.muted ? '<i class="fas fa-volume-mute"></i>' : '<i class="fas fa-volume-up"></i>';
+        }
+
+        function toggleFullscreen() {
+            if (!document.fullscreenElement && !document.mozFullScreenElement && !document.webkitFullscreenElement && !document.msFullscreenElement) {
+                if (wrapper.requestFullscreen) wrapper.requestFullscreen();
+                else if (wrapper.msRequestFullscreen) wrapper.msRequestFullscreen();
+                else if (wrapper.mozRequestFullScreen) wrapper.mozRequestFullScreen();
+                else if (wrapper.webkitRequestFullscreen) wrapper.webkitRequestFullscreen(Element.ALLOW_KEYBOARD_INPUT);
+            } else {
+                if (document.exitFullscreen) document.exitFullscreen();
+                else if (document.msExitFullscreen) document.msExitFullscreen();
+                else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+                else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+            }
+        }
+
+        // Перемотка по клику на полосу прогресса
+        function scrub(e) {
+            var rect = progressContainer.getBoundingClientRect();
+            var pos = (e.clientX - rect.left) / rect.width;
+            video.currentTime = pos * video.duration;
+        }
+
+        // Обновление полоски времени
+        video.addEventListener('timeupdate', function() {
+            var percent = (video.currentTime / video.duration) * 100;
+            progressFill.style.width = percent + '%';
+            timeDisplay.innerText = formatTime(video.currentTime) + " / " + formatTime(video.duration);
+        });
+
+        // Привязка событий к нижним кнопкам
+        playBtn.addEventListener('click', togglePlay);
+        muteBtn.addEventListener('click', toggleMute);
+        fullBtn.addEventListener('click', toggleFullscreen);
+        progressContainer.addEventListener('click', scrub);
+
+        // === 4. УМНАЯ ЛОГИКА ТАПОВ ПО ЭКРАНУ (Пауза / Перемотка) ===
+        var clickTimer = null;
+
+        function showTapAnimation(element) {
+            element.classList.remove('pulse');
+            void element.offsetWidth; // Магия ES5 для перезапуска анимации
+            element.classList.add('pulse');
+        }
+
+        wrapper.addEventListener('click', function(e) {
+            // Игнорируем клики, если они попали по нижней панели управления
+            if (e.target.closest('#custom-controls')) return;
+
+            var rect = wrapper.getBoundingClientRect();
+            var clickX = e.clientX - rect.left;
+            var isLeftSide = clickX < (rect.width / 2);
+
+            if (clickTimer === null) {
+                // Первый клик: ждем 250мс
+                clickTimer = setTimeout(function() {
+                    togglePlay();
+                    clickTimer = null;
+                }, 250);
+            } else {
+                // Второй клик: отменяем паузу, мотаем время!
+                clearTimeout(clickTimer);
+                clickTimer = null;
+
+                if (isLeftSide) {
+                    video.currentTime -= 5;
+                    showTapAnimation(tapLeftInd);
+                } else {
+                    video.currentTime += 5;
+                    showTapAnimation(tapRightInd);
+                }
+            }
+        });
+
+        // === 5. ГОРЯЧИЕ КЛАВИШИ ===
+        document.addEventListener('keydown', function(e) {
+            // Игнорируем, если юзер пишет текст (на будущее)
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+            switch(e.keyCode) {
+                case 32: // Пробел
+                    e.preventDefault();
+                    togglePlay();
+                    break;
+                case 39: // Стрелка вправо
+                    video.currentTime += 5;
+                    showTapAnimation(tapRightInd);
+                    break;
+                case 37: // Стрелка влево
+                    video.currentTime -= 5;
+                    showTapAnimation(tapLeftInd);
+                    break;
+                case 70: // Буква F
+                    toggleFullscreen();
+                    break;
+                case 77: // Буква M
+                    toggleMute();
+                    break;
+            }
+        });
+    </script>
+
+</body>
+</html>
