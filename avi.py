@@ -5,7 +5,12 @@ import urllib.parse
 import hashlib
 import json
 import threading
-from flask import Flask, jsonify, send_from_directory, render_template_string, request
+import atexit
+import signal
+import sys
+import shutil
+import platform
+from flask import Flask, jsonify, send_from_directory, render_template_string, request, make_response
 
 # === Настройки ===
 PORT = 8000
@@ -25,8 +30,83 @@ app = Flask(__name__)
 meta_lock = threading.Lock()
 playlist_lock = threading.Lock()
 
-# Глобальная переменная для контроля процесса FFmpeg
-current_ffmpeg_process = None
+# Словарь для контроля процессов FFmpeg
+ffmpeg_processes = {}
+ffmpeg_lock = threading.Lock()
+
+def kill_ffmpeg_processes(stream_id=None):
+    """Принудительное убийство ffmpeg процессов (особенно для Windows)"""
+    is_windows = platform.system() == 'Windows'
+    
+    if is_windows:
+        if stream_id:
+            with ffmpeg_lock:
+                if stream_id in ffmpeg_processes:
+                    proc = ffmpeg_processes[stream_id]
+                    try:
+                        subprocess.run(['taskkill', '/F', '/PID', str(proc.pid)], capture_output=True)
+                        print(f"🔪 Убит ffmpeg процесс PID: {proc.pid}")
+                    except Exception as e:
+                        print(f"Ошибка taskkill PID: {e}")
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except:
+                        try:
+                            proc.kill()
+                        except:
+                            pass
+                    finally:
+                        if stream_id in ffmpeg_processes:
+                            del ffmpeg_processes[stream_id]
+        else:
+            try:
+                result = subprocess.run(['taskkill', '/F', '/IM', 'ffmpeg.exe'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    print("🔪 Убиты все процессы ffmpeg.exe")
+                else:
+                    print(f"ffmpeg.exe не найден или уже остановлен")
+            except Exception as e:
+                print(f"Ошибка при убийстве ffmpeg: {e}")
+            
+            with ffmpeg_lock:
+                for proc in ffmpeg_processes.values():
+                    try:
+                        proc.terminate()
+                    except:
+                        pass
+                ffmpeg_processes.clear()
+    else:
+        if stream_id and stream_id in ffmpeg_processes:
+            proc = ffmpeg_processes[stream_id]
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except:
+                proc.kill()
+            if stream_id in ffmpeg_processes:
+                del ffmpeg_processes[stream_id]
+        elif not stream_id:
+            with ffmpeg_lock:
+                for proc in ffmpeg_processes.values():
+                    try:
+                        proc.terminate()
+                    except:
+                        pass
+                ffmpeg_processes.clear()
+
+def cleanup_all_processes():
+    """Очистка всех ffmpeg процессов при завершении сервера"""
+    kill_ffmpeg_processes()
+
+atexit.register(cleanup_all_processes)
+
+def signal_handler(sig, frame):
+    kill_ffmpeg_processes()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 def get_secure_path(filename):
     """Защита от Path Traversal (выхода за пределы FOLDER)"""
@@ -177,6 +257,27 @@ def pop_playlist():
     return jsonify(pl)
 
 # ==========================================
+# ОСТАНОВКА КОНВЕРТАЦИИ (С ПОДДЕРЖКОЙ WINDOWS)
+# ==========================================
+@app.route('/stop/<stream_id>', methods=['POST'])
+def stop_conversion(stream_id):
+    """Остановка конвертации видео (с поддержкой Windows)"""
+    kill_ffmpeg_processes(stream_id)
+    
+    # Удаляем временные файлы
+    stream_dir = os.path.join(HLS_CACHE, stream_id)
+    if os.path.exists(stream_dir):
+        shutil.rmtree(stream_dir, ignore_errors=True)
+    
+    return jsonify({"status": "stopped", "stream_id": stream_id})
+
+@app.route('/stop_all', methods=['POST'])
+def stop_all_conversions():
+    """Остановка всех конвертаций (с поддержкой Windows)"""
+    kill_ffmpeg_processes()
+    return jsonify({"status": "stopped", "stopped": "all"})
+
+# ==========================================
 # 1. МАРШРУТ: ГЛАВНАЯ СТРАНИЦА (ГАЛЕРЕЯ)
 # ==========================================
 @app.route('/')
@@ -193,14 +294,6 @@ def index():
     try: items = os.listdir(current_dir)
     except OSError: items = []
 
-    meta_cache = {}
-    with meta_lock:
-        if os.path.exists(META_FILE):
-            try:
-                with open(META_FILE, 'r') as f: meta_cache = json.load(f)
-            except Exception: pass
-    meta_changed = False
-        
     folders = []
     files = []
     
@@ -214,6 +307,47 @@ def index():
                 
     folders.sort()
     files.sort()
+
+    # --- LITE РЕЖИМ (ДЛЯ СТАРЫХ УСТРОЙСТВ) ---
+    if request.args.get('lite') == '1':
+        html = """<!DOCTYPE html>
+        <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>AVI Lite</title></head>
+        <body style="background:#111; color:#eee; font-family:sans-serif; margin:15px;">
+        <h2 style="color:#2196f3; margin-top:5px;">AVI Media (Lite)</h2>
+        <div style="background:#222; padding:10px; border-radius:5px; margin-bottom:15px; word-break:break-all;">Папка: /""" + rel_path + """</div>
+        <ul style="list-style:none; padding:0; line-height:1.8; font-size:16px;">
+        """
+        if rel_path:
+            parent = os.path.dirname(rel_path)
+            html += f"<li style='margin-bottom:10px;'><a href='/?p={urllib.parse.quote(parent)}&lite=1' style='color:#ffca28; text-decoration:none;'>📁 [Назад] ..</a></li>"
+        
+        for folder in folders:
+            sub = os.path.join(rel_path, folder) if rel_path else folder
+            html += f"<li style='margin-bottom:10px;'><a href='/?p={urllib.parse.quote(sub)}&lite=1' style='color:#ffca28; text-decoration:none;'>📁 {folder}</a></li>"
+            
+        for f in files:
+            file_rel_path = os.path.join(rel_path, f) if rel_path else f
+            safe_name = urllib.parse.quote(file_rel_path)
+            ext = os.path.splitext(f)[1].lower()
+            
+            if ext == '.ofpl':
+                html += f"<li style='margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #333;'><a href='/lite_playlist?file={safe_name}' style='color:#4caf50; text-decoration:none; display:block;'>📑 {f} (Плейлист)</a></li>"
+            else:
+                html += f"<li style='margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #333;'><a href='/lite_player?file={safe_name}' style='color:#64b5f6; text-decoration:none; display:block;'>🎬 {f}</a></li>"
+            
+        html += "</ul><br><a href='/?p=" + urllib.parse.quote(rel_path) + "' style='color:#888; font-size:14px;'>Перейти в полную версию</a></body></html>"
+        return render_template_string(html)
+    # -----------------------------------------
+
+    meta_cache = {}
+    with meta_lock:
+        if os.path.exists(META_FILE):
+            try:
+                with open(META_FILE, 'r') as f: meta_cache = json.load(f)
+            except Exception: pass
+    meta_changed = False
+        
     cards_html = ""
     
     if rel_path:
@@ -246,7 +380,6 @@ def index():
         js_safe_name = f.replace("'", "\\'").replace('"', '&quot;')
         display_name = os.path.splitext(f)[0].replace('.', ' ').replace('_', ' ')
         
-        # Если это сохраненный плейлист
         if ext == '.ofpl':
             cards_html += f'''
             <div class="media-card file-card" data-type="playlist" data-name="{display_name.lower()}" data-duration="0" onclick="openSavedPlaylistModal('{safe_name}', '{js_safe_name}')">
@@ -257,7 +390,6 @@ def index():
             </div>'''
             continue
             
-        # Медиа файл
         file_size = os.stat(full_path).st_size
         size_str = sizeof_fmt(file_size)
         cache_key = f"{f}_{file_size}"
@@ -321,7 +453,7 @@ def index():
     h1 {{ text-align: center; color: #bbdefb; font-weight: 300; letter-spacing: 2px; margin-bottom: 20px; }}
     .top-bar {{ display: flex; justify-content: space-between; align-items: center; max-width: 1200px; margin: 0 auto 15px auto; flex-wrap: wrap; gap: 15px; }}
     .path-indicator {{ color: #888; font-size: 14px; background: rgba(255,255,255,0.05); padding: 8px 16px; border-radius: 20px; flex-grow: 1; }}
-    .sort-select, .action-btn {{ background: #1e1e2d; color: #e0e0e0; border: 1px solid rgba(255,255,255,0.2); padding: 8px 15px; border-radius: 20px; outline: none; font-size: 14px; cursor: pointer; transition: 0.2s; }}
+    .sort-select, .action-btn {{ background: #1e1e2d; color: #e0e0e0; border: 1px solid rgba(255,255,255,0.2); padding: 8px 15px; border-radius: 20px; outline: none; font-size: 14px; cursor: pointer; transition: 0.2s; text-decoration: none; }}
     .action-btn:hover {{ background: #2196f3; color: white; border-color: #2196f3; box-shadow: 0 4px 10px rgba(33, 150, 243, 0.2); }}
     
     #playlist-bar {{
@@ -330,18 +462,14 @@ def index():
     }}
     
     .playlist-controls button {{ background: rgba(255, 255, 255, 0.03); color: #e0e0e0; border: 1px solid rgba(255,255,255,0.1); padding: 8px 15px; border-radius: 8px; cursor: pointer; margin-left: 10px; font-weight: 500; transition: all 0.3s ease; display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }}
-    
     .playlist-controls button.edit {{ color: #ffb74d; border-color: rgba(255, 183, 77, 0.4); }}
-    .playlist-controls button.edit:hover {{ background: rgba(255, 183, 77, 0.15); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(255, 183, 77, 0.2); border-color: #ffb74d; color: #fff; }}
-    
+    .playlist-controls button.edit:hover {{ background: rgba(255, 183, 77, 0.15); border-color: #ffb74d; color: #fff; }}
     .playlist-controls button.save {{ color: #81c784; border-color: rgba(129, 199, 132, 0.4); }}
-    .playlist-controls button.save:hover {{ background: rgba(129, 199, 132, 0.15); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(129, 199, 132, 0.2); border-color: #81c784; color: #fff; }}
-    
+    .playlist-controls button.save:hover {{ background: rgba(129, 199, 132, 0.15); border-color: #81c784; color: #fff; }}
     .playlist-controls button.play-btn {{ color: #64b5f6; border-color: rgba(100, 181, 246, 0.4); }}
-    .playlist-controls button.play-btn:hover {{ background: rgba(100, 181, 246, 0.15); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(100, 181, 246, 0.2); border-color: #64b5f6; color: #fff; }}
-    
+    .playlist-controls button.play-btn:hover {{ background: rgba(100, 181, 246, 0.15); border-color: #64b5f6; color: #fff; }}
     .playlist-controls button.clear {{ color: #e57373; border-color: rgba(229, 115, 115, 0.4); }}
-    .playlist-controls button.clear:hover {{ background: rgba(229, 115, 115, 0.15); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(229, 115, 115, 0.2); border-color: #e57373; color: #fff; }}
+    .playlist-controls button.clear:hover {{ background: rgba(229, 115, 115, 0.15); border-color: #e57373; color: #fff; }}
 
     .media-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 25px; max-width: 1200px; margin: 0 auto; }}
     .media-card {{ background: rgba(30, 30, 45, 0.8); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 15px; padding: 20px; text-align: center; cursor: pointer; position: relative; overflow: hidden; transition: all 0.3s ease; box-shadow: 0 10px 20px rgba(0,0,0,0.3); display: flex; flex-direction: column; justify-content: space-between; height: 260px; box-sizing: border-box; }}
@@ -370,7 +498,6 @@ def index():
     .quality-btn {{ display: block; width: 100%; padding: 15px; margin-bottom: 10px; background: #2a2a3f; color: white; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; }}
     .quality-btn.low:hover {{ background: #4caf50; }} .quality-btn.medium:hover {{ background: #ff9800; }} .quality-btn.high:hover {{ background: #f44336; }} .quality-btn.cinema {{ border: 1px solid #9c27b0; }} .quality-btn.cinema:hover {{ background: #9c27b0; }}
 
-    /* Queue Modal specific with Drag & Drop styling */
     #queue-list {{ list-style: none; padding: 0; margin: 0; overflow-y: auto; flex-grow: 1; }}
     #queue-list::-webkit-scrollbar {{ width: 6px; }}
     #queue-list::-webkit-scrollbar-track {{ background: rgba(0,0,0,0.2); }}
@@ -380,11 +507,9 @@ def index():
     .queue-item:hover {{ background: rgba(0,0,0,0.4); border-color: rgba(33, 150, 243, 0.3); }}
     .queue-item.over {{ border-top: 2px dashed #2196f3; background: rgba(33, 150, 243, 0.15); }}
     .drag-handle {{ color: #666; margin-right: 15px; font-size: 16px; transition: 0.2s; display: flex; align-items: center; }}
-    .queue-item:hover .drag-handle {{ color: #bbdefb; }}
-    
     .queue-item-name {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 10px; color: #ddd; flex-grow: 1; pointer-events: none; }}
     .queue-remove-btn {{ color: #e57373; cursor: pointer; background: none; border: none; font-size: 16px; padding: 5px; transition: 0.2s; opacity: 0.7; }}
-    .queue-remove-btn:hover {{ color: #f44336; opacity: 1; transform: scale(1.1); }}
+    .queue-remove-btn:hover {{ color: #f44336; opacity: 1; }}
 
     #loading-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(10, 10, 15, 0.95); display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 1000; opacity: 0; visibility: hidden; transition: all 0.4s ease; backdrop-filter: blur(15px); }}
     #loading-overlay.active {{ opacity: 1; visibility: visible; }}
@@ -393,6 +518,12 @@ def index():
     .status-text {{ font-size: 24px; font-weight: 300; margin-bottom: 15px; color: #bbdefb; text-align: center; }}
     .progress-container {{ width: 300px; height: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden; }}
     .progress-bar {{ height: 100%; width: 0%; background: linear-gradient(90deg, #2196f3, #00bcd4); transition: width 0.5s ease; }}
+    
+    @keyframes fadeOut {{
+        0% {{ opacity: 1; transform: translateY(0); }}
+        70% {{ opacity: 1; transform: translateY(0); }}
+        100% {{ opacity: 0; transform: translateY(-20px); }}
+    }}
 </style>
 </head>
 <body>
@@ -411,13 +542,16 @@ def index():
 
     <div class="top-bar">
         {path_indicator}
-        <button class="action-btn" onclick="addAllToPlaylist()"><i class="fas fa-plus-circle"></i> Добавить все медиа</button>
-        <select class="sort-select" id="sort-select" onchange="sortCards()">
-            <option value="name_asc">Имя (А-Я)</option>
-            <option value="name_desc">Имя (Я-А)</option>
-            <option value="dur_desc">Самые длинные</option>
-            <option value="dur_asc">Самые короткие</option>
-        </select>
+        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+            <a href="/?p={urllib.parse.quote(rel_path)}&lite=1" class="action-btn"><i class="fas fa-mobile-alt"></i> Lite Режим</a>
+            <button class="action-btn" onclick="addAllToPlaylist()"><i class="fas fa-plus-circle"></i> Добавить всё</button>
+            <select class="sort-select" id="sort-select" onchange="sortCards()">
+                <option value="name_asc">Имя (А-Я)</option>
+                <option value="name_desc">Имя (Я-А)</option>
+                <option value="dur_desc">Самые длинные</option>
+                <option value="dur_asc">Самые короткие</option>
+            </select>
+        </div>
     </div>
     
     <div class="media-grid" id="media-grid">
@@ -433,6 +567,7 @@ def index():
                 <input type="number" id="fps-input" placeholder="Исходный (напр. 24, 60)">
             </div>
             <button class="quality-btn low" onclick="startTranscoding('low')">Слабый (360p)</button>
+            <button class="quality-btn" style="background:#607d8b; border:none;" onclick="startTranscoding('mpeg1')" onmouseover="this.style.background='#78909c'" onmouseout="this.style.background='#607d8b'">Ретро (MPEG1 480p)</button>
             <button class="quality-btn medium" onclick="startTranscoding('medium')">Средний (720p)</button>
             <button class="quality-btn cinema" onclick="startTranscoding('cinema')">Кино (720p HQ)</button>
             <button class="quality-btn high" onclick="startTranscoding('high')">Высокий (Исходное)</button>
@@ -457,7 +592,7 @@ def index():
                     <button onclick="renamePlaylist()" title="Переименовать" style="background:none; border:none; color:#888; cursor:pointer; font-size: 14px; transition: 0.2s;" onmouseover="this.style.color='#fff'" onmouseout="this.style.color='#888'"><i class="fas fa-pen"></i></button>
                 </div>
                 <button class="action-btn" onclick="closeModal('queue-modal')" style="font-size: 13px; padding: 6px 12px; background: rgba(33, 150, 243, 0.1); color: #64b5f6; border-color: rgba(33, 150, 243, 0.4);">
-                    <i class="fas fa-plus"></i> Добавить медиа
+                    <i class="fas fa-plus"></i> Добавить
                 </button>
             </div>
             <ul id="queue-list"></ul>
@@ -471,6 +606,9 @@ def index():
     </div>
 
     <script>
+        let currentStreamId = null;
+        let currentCheckInterval = null;
+        
         function sortCards() {{
             const grid = document.getElementById('media-grid');
             const folders = Array.from(grid.querySelectorAll('.folder-card'));
@@ -567,8 +705,6 @@ def index():
 
         async function savePlaylistFile() {{
             let name = currentEditingPlaylistName;
-            
-            // Если имя еще не задано, просим его ввести
             if (!name) {{
                 let input = prompt("Введите имя для нового плейлиста:", "MyPlaylist");
                 if (!input || input.trim() === "") return;
@@ -576,7 +712,6 @@ def index():
                 currentEditingPlaylistName = name;
             }}
             
-            // Сохраняем мгновенно под текущим именем
             const urlParams = new URLSearchParams(window.location.search);
             const res = await fetch('/api/playlist/save_file', {{
                 method: 'POST', headers: {{'Content-Type': 'application/json'}},
@@ -584,12 +719,8 @@ def index():
             }});
             
             const data = await res.json();
-            if(data.status === 'success') {{
-                updatePlaylistUI();
-                location.reload(); 
-            }} else {{
-                alert('Ошибка сохранения: ' + (data.msg || ''));
-            }}
+            if(data.status === 'success') {{ location.reload(); }} 
+            else {{ alert('Ошибка сохранения'); }}
         }}
 
         function openSavedPlaylistModal(filepath, displayName) {{
@@ -606,18 +737,13 @@ def index():
             }});
             const data = await res.json();
             if (data.files && data.files.length > 0) {{
-                playlistFiles = data.files;
-                playlistNames = data.names;
-                
+                playlistFiles = data.files; playlistNames = data.names;
                 await fetch('/api/playlist/set', {{
                     method: 'POST', headers: {{'Content-Type': 'application/json'}},
                     body: JSON.stringify({{files: playlistFiles, names: playlistNames}})
                 }});
-                
                 updatePlaylistUI();
                 openOptionsModal(playlistFiles[0], document.getElementById('saved-pl-title').innerHTML, true);
-            }} else {{
-                alert("Плейлист пуст или поврежден");
             }}
         }}
         
@@ -629,17 +755,13 @@ def index():
             }});
             const data = await res.json();
             if (data.files) {{
-                playlistFiles = data.files;
-                playlistNames = data.names;
+                playlistFiles = data.files; playlistNames = data.names;
                 currentEditingPlaylistName = document.getElementById('saved-pl-title').innerText;
-                
                 await fetch('/api/playlist/set', {{
                     method: 'POST', headers: {{'Content-Type': 'application/json'}},
                     body: JSON.stringify({{files: playlistFiles, names: playlistNames}})
                 }});
-                
-                updatePlaylistUI();
-                openQueueModal();
+                updatePlaylistUI(); openQueueModal();
             }}
         }}
 
@@ -648,113 +770,49 @@ def index():
             if(playlistFiles.length > 0) {{
                 bar.style.display = 'flex';
                 document.getElementById('pl-count').innerText = playlistFiles.length;
-                
                 let displayName = currentEditingPlaylistName ? currentEditingPlaylistName.replace('.ofpl', '') : 'Новый плейлист';
                 document.getElementById('current-pl-name').innerText = displayName;
-                
                 let queueTitle = document.getElementById('queue-modal-title');
                 if(queueTitle) queueTitle.innerText = displayName;
             }} else {{ bar.style.display = 'none'; }}
         }}
         
-        // --- DRAG AND DROP ЛОГИКА ---
         let dragSrcEl = null;
-
-        function handleDragStart(e) {{
-            dragSrcEl = this;
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', this.dataset.index);
-            setTimeout(() => this.style.opacity = '0.4', 0);
-        }}
-
-        function handleDragOver(e) {{
-            if (e.preventDefault) e.preventDefault();
-            e.dataTransfer.dropEffect = 'move';
-            return false;
-        }}
-
-        function handleDragEnter(e) {{
-            this.classList.add('over');
-        }}
-
-        function handleDragLeave(e) {{
-            this.classList.remove('over');
-        }}
-
+        function handleDragStart(e) {{ dragSrcEl = this; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', this.dataset.index); setTimeout(() => this.style.opacity = '0.4', 0); }}
+        function handleDragOver(e) {{ if (e.preventDefault) e.preventDefault(); e.dataTransfer.dropEffect = 'move'; return false; }}
+        function handleDragEnter(e) {{ this.classList.add('over'); }}
+        function handleDragLeave(e) {{ this.classList.remove('over'); }}
         function handleDrop(e) {{
             if (e.stopPropagation) e.stopPropagation();
             if (dragSrcEl !== this) {{
                 let fromIndex = parseInt(dragSrcEl.dataset.index);
                 let toIndex = parseInt(this.dataset.index);
-                
                 let movedFile = playlistFiles.splice(fromIndex, 1)[0];
                 let movedName = playlistNames.splice(fromIndex, 1)[0];
-                
                 playlistFiles.splice(toIndex, 0, movedFile);
                 playlistNames.splice(toIndex, 0, movedName);
-                
-                // Синхронизируем изменения с сервером
-                fetch('/api/playlist/set', {{
-                    method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ files: playlistFiles, names: playlistNames }})
-                }});
-                
+                fetch('/api/playlist/set', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ files: playlistFiles, names: playlistNames }}) }});
                 renderQueueItems();
             }}
             return false;
         }}
-
-        function handleDragEnd(e) {{
-            this.style.opacity = '1';
-            document.querySelectorAll('.queue-item').forEach(item => {{
-                item.classList.remove('over');
-            }});
-        }}
+        function handleDragEnd(e) {{ this.style.opacity = '1'; document.querySelectorAll('.queue-item').forEach(item => item.classList.remove('over')); }}
 
         function renderQueueItems() {{
-            const list = document.getElementById('queue-list');
-            list.innerHTML = '';
+            const list = document.getElementById('queue-list'); list.innerHTML = '';
             for(let i = 0; i < playlistFiles.length; i++) {{
-                const li = document.createElement('li');
-                li.className = 'queue-item';
-                li.draggable = true;
-                li.dataset.index = i;
-                
-                li.innerHTML = `
-                    <div style="display:flex; align-items:center; overflow:hidden; flex-grow:1;">
-                        <i class="fas fa-grip-lines drag-handle"></i>
-                        <div class="queue-item-name" title="${{playlistNames[i]}}">${{i + 1}}. ${{playlistNames[i]}}</div>
-                    </div>
-                    <button class="queue-remove-btn" onclick="removeFromPlaylist(${{i}})"><i class="fas fa-times"></i></button>
-                `;
-                
-                li.addEventListener('dragstart', handleDragStart);
-                li.addEventListener('dragover', handleDragOver);
-                li.addEventListener('dragenter', handleDragEnter);
-                li.addEventListener('dragleave', handleDragLeave);
-                li.addEventListener('drop', handleDrop);
-                li.addEventListener('dragend', handleDragEnd);
-                
+                const li = document.createElement('li'); li.className = 'queue-item'; li.draggable = true; li.dataset.index = i;
+                li.innerHTML = `<div style="display:flex; align-items:center; overflow:hidden; flex-grow:1;"><i class="fas fa-grip-lines drag-handle"></i><div class="queue-item-name" title="${{playlistNames[i]}}">${{i + 1}}. ${{playlistNames[i]}}</div></div><button class="queue-remove-btn" onclick="removeFromPlaylist(${{i}})"><i class="fas fa-times"></i></button>`;
+                li.addEventListener('dragstart', handleDragStart); li.addEventListener('dragover', handleDragOver); li.addEventListener('dragenter', handleDragEnter); li.addEventListener('dragleave', handleDragLeave); li.addEventListener('drop', handleDrop); li.addEventListener('dragend', handleDragEnd);
                 list.appendChild(li);
             }}
-            if(playlistFiles.length === 0) list.innerHTML = '<li class="queue-item" style="color:#888; justify-content:center; background: transparent; border: none; cursor: default;">Очередь пуста. Выберите медиа из галереи.</li>';
+            if(playlistFiles.length === 0) list.innerHTML = '<li class="queue-item" style="color:#888; justify-content:center; background: transparent; border: none; cursor: default;">Очередь пуста.</li>';
         }}
         
-        function openQueueModal() {{
-            renderQueueItems();
-            document.getElementById('queue-modal').classList.add('active');
-        }}
-
-        function startPlaylist() {{
-            if(playlistFiles.length > 0) {{
-                openOptionsModal(playlistFiles[0], playlistNames[0] + " (Плейлист)", true);
-            }}
-        }}
-
-        window.addEventListener('DOMContentLoaded', () => {{
-            sortCards();
-            loadPlaylistFromServer();
-        }});
+        function openQueueModal() {{ renderQueueItems(); document.getElementById('queue-modal').classList.add('active'); }}
+        function startPlaylist() {{ if(playlistFiles.length > 0) openOptionsModal(playlistFiles[0], playlistNames[0] + " (Плейлист)", true); }}
+        
+        window.addEventListener('DOMContentLoaded', () => {{ sortCards(); loadPlaylistFromServer(); }});
 
         let currentFileSafeName = "";
         function openOptionsModal(safeName, displayName, isPlaylist = false) {{
@@ -774,6 +832,74 @@ def index():
         }}
         
         function closeModal(modalId) {{ document.getElementById(modalId).classList.remove('active'); }}
+        
+        async function stopCurrentConversion() {{
+            if (!currentStreamId) return;
+            try {{
+                await fetch('/stop/' + currentStreamId, {{ method: 'POST' }});
+            }} catch(e) {{ console.log('Stop error:', e); }}
+            if (currentCheckInterval) {{
+                clearInterval(currentCheckInterval);
+                currentCheckInterval = null;
+            }}
+            currentStreamId = null;
+        }}
+
+        function showStopNotification(message) {{
+            const notification = document.createElement('div');
+            notification.style.cssText = `
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                background: #f44336;
+                color: white;
+                padding: 12px 24px;
+                border-radius: 8px;
+                z-index: 10000;
+                animation: fadeOut 2s ease-out forwards;
+                font-size: 14px;
+                font-weight: bold;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            `;
+            notification.innerHTML = '<i class="fas fa-stop-circle"></i> ' + message;
+            document.body.appendChild(notification);
+            setTimeout(() => notification.remove(), 2000);
+        }}
+
+        document.addEventListener('keydown', async function(e) {{
+            if (e.code === 'Escape') {{
+                e.preventDefault();
+                
+                let stopped = false;
+                
+                if (currentStreamId) {{
+                    try {{
+                        await fetch('/stop/' + currentStreamId, {{ method: 'POST' }});
+                        showStopNotification('⏹️ FFmpeg процесс остановлен по ESC');
+                        stopped = true;
+                    }} catch(err) {{
+                        console.error('Stop error:', err);
+                    }}
+                    
+                    if (currentCheckInterval) {{
+                        clearInterval(currentCheckInterval);
+                        currentCheckInterval = null;
+                    }}
+                    currentStreamId = null;
+                }}
+                
+                const overlay = document.getElementById('loading-overlay');
+                if (overlay && overlay.classList.contains('active')) {{
+                    overlay.classList.remove('active');
+                    if (!stopped) showStopNotification('⏹️ Загрузка отменена по ESC');
+                    stopped = true;
+                }}
+                
+                if (!stopped) {{
+                    showStopNotification('ℹ️ Нет активной конвертации');
+                }}
+            }}
+        }});
 
         async function startTranscoding(quality) {{
             closeModal('options-modal');
@@ -781,6 +907,8 @@ def index():
             const overlay = document.getElementById('loading-overlay');
             const statusText = document.getElementById('status-text');
             const progressBar = document.getElementById('progress-bar');
+            
+            await stopCurrentConversion();
             
             overlay.classList.add('active');
             progressBar.style.width = '15%';
@@ -795,25 +923,49 @@ def index():
                 
                 if (data.status === 'direct') {{
                     progressBar.style.width = '100%';
-                    statusText.textContent = 'Короткое видео! Прямой запуск...';
+                    statusText.textContent = 'Прямой запуск...';
                     let playerUrl = "/player?direct=" + encodeURIComponent(data.direct_url) + "&quality=" + quality + "&file=" + encodeURIComponent(currentFileSafeName);
                     setTimeout(() => window.location.href = playerUrl, 400);
                     return;
                 }}
+
+                if (data.cached) {{
+                    progressBar.style.width = '100%';
+                    statusText.textContent = 'Загружено из умного кеша!';
+                    let playerUrl = "/player?stream=" + encodeURIComponent("/stream/" + data.stream_id + "/index.m3u8") + "&quality=" + quality + "&file=" + encodeURIComponent(currentFileSafeName);
+                    setTimeout(() => window.location.href = playerUrl, 400);
+                    return;
+                }}
                 
+                currentStreamId = data.stream_id;
                 progressBar.style.width = '40%';
                 statusText.textContent = 'Рендеринг потока...';
                 
-                const checkInterval = setInterval(async () => {{
-                    const statusRes = await fetch('/status/' + data.stream_id);
+                let checkCount = 0;
+                currentCheckInterval = setInterval(async () => {{
+                    checkCount++;
+                    const statusRes = await fetch('/status/' + currentStreamId);
                     const st = await statusRes.json();
                     
+                    if (progressBar.style.width !== '100%') {{
+                        let newWidth = 40 + Math.min(55, checkCount * 2);
+                        progressBar.style.width = newWidth + '%';
+                    }}
+                    
                     if (st.ready) {{
-                        clearInterval(checkInterval);
+                        clearInterval(currentCheckInterval);
+                        currentCheckInterval = null;
                         progressBar.style.width = '100%';
                         statusText.textContent = 'Готово! Запуск плеера...';
-                        let playerUrl = "/player?stream=" + encodeURIComponent("/stream/" + data.stream_id + "/index.m3u8") + "&quality=" + quality + "&file=" + encodeURIComponent(currentFileSafeName);
+                        let playerUrl = "/player?stream=" + encodeURIComponent("/stream/" + currentStreamId + "/index.m3u8") + "&quality=" + quality + "&file=" + encodeURIComponent(currentFileSafeName);
                         setTimeout(() => window.location.href = playerUrl, 800);
+                        currentStreamId = null;
+                    }} else if (checkCount > 180) {{
+                        clearInterval(currentCheckInterval);
+                        currentCheckInterval = null;
+                        statusText.textContent = 'Ошибка: таймаут конвертации';
+                        statusText.style.color = '#f44336';
+                        setTimeout(() => overlay.classList.remove('active'), 3000);
                     }}
                 }}, 2000);
             }} catch (e) {{
@@ -821,6 +973,12 @@ def index():
                 setTimeout(() => overlay.classList.remove('active'), 3000);
             }}
         }}
+        
+        window.addEventListener('beforeunload', () => {{
+            if (currentStreamId) {{
+                navigator.sendBeacon('/stop/' + currentStreamId);
+            }}
+        }});
     </script>
 </body>
 </html>'''
@@ -844,7 +1002,6 @@ PLAYER_HTML = """<!DOCTYPE html>
         #player-wrapper { position: relative; width: 100%; max-width: 1000px; background: #000; border-radius: 12px; overflow: hidden; box-shadow: 0 15px 40px rgba(0,0,0,0.8); margin-top: 20px; user-select: none; }
         video { width: 100%; height: 100%; object-fit: contain; display: block; cursor: pointer; }
         
-        /* Fullscreen adjustments */
         #player-wrapper:-webkit-full-screen { max-width: none !important; width: 100vw !important; height: 100vh !important; margin: 0 !important; border-radius: 0 !important; display: flex; align-items: center; justify-content: center; }
         #player-wrapper:-moz-full-screen { max-width: none !important; width: 100vw !important; height: 100vh !important; margin: 0 !important; border-radius: 0 !important; display: flex; align-items: center; justify-content: center; }
         #player-wrapper:fullscreen { max-width: none !important; width: 100vw !important; height: 100vh !important; margin: 0 !important; border-radius: 0 !important; display: flex; align-items: center; justify-content: center; }
@@ -897,11 +1054,34 @@ PLAYER_HTML = """<!DOCTYPE html>
         .status-text { font-size: 24px; font-weight: 300; margin-bottom: 15px; color: #bbdefb; }
         .progress-container-ld { width: 300px; height: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden; }
         .progress-bar-ld { height: 100%; width: 0%; background: linear-gradient(90deg, #2196f3, #00bcd4); transition: width 0.5s; }
+        #cancel-loading { margin-top: 20px; background: #f44336; border: none; color: white; padding: 10px 20px; border-radius: 20px; cursor: pointer; font-size: 14px; transition: 0.2s; }
+        #cancel-loading:hover { background: #d32f2f; transform: scale(1.05); }
+        
+        @keyframes fadeOut {
+            0% { opacity: 1; transform: translateY(0); }
+            70% { opacity: 1; transform: translateY(0); }
+            100% { opacity: 0; transform: translateY(-20px); }
+        }
+        
+        .stop-notification {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #f44336;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 8px;
+            z-index: 10000;
+            animation: fadeOut 2s ease-out forwards;
+            font-size: 14px;
+            font-weight: bold;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        }
     </style>
 </head>
 <body>
     <a href="/" class="back-gallery-btn"><i class="fas fa-arrow-left"></i></a>
-    <h2><i class="fas fa-play-circle" style="color: #2196f3;"></i> AVI Player</h2>
+    <h2><i class="fas fa-play-circle" style="color: #2196f3;"></i> AVI Player <span style="font-size: 14px; color: #888;">(ESC - остановить FFmpeg)</span></h2>
     
     <div id="player-wrapper" class="paused">
         <video id="video"></video>
@@ -934,11 +1114,17 @@ PLAYER_HTML = """<!DOCTYPE html>
 
     <div id="loading-overlay">
         <i class="fas fa-cog loader-icon"></i>
-        <div class="status-text" id="status-text">Кодируем следующее видео...</div>
+        <div class="status-text" id="status-text">Подготовка видео...</div>
         <div class="progress-container-ld"><div class="progress-bar-ld" id="progress-bar"></div></div>
+        <button id="cancel-loading">Отменить загрузку</button>
     </div>
 
     <script>
+        let currentStreamId = null;
+        let currentCheckInterval = null;
+        let currentHls = null;
+        let isLoadingVideo = false;
+        
         var urlParams = new URLSearchParams(window.location.search);
         var streamUrl = urlParams.get('stream');
         var directUrl = urlParams.get('direct');
@@ -948,22 +1134,18 @@ PLAYER_HTML = """<!DOCTYPE html>
         var plFiles = JSON.parse(sessionStorage.getItem('ofavi_playlist_files') || "[]");
         var plNames = JSON.parse(sessionStorage.getItem('ofavi_playlist_names') || "[]");
         var currentIndex = plFiles.indexOf(currentFileName);
+        
+        if (currentIndex === -1 && currentFileName) {
+            for (let i = 0; i < plFiles.length; i++) {
+                if (plFiles[i].includes(currentFileName) || currentFileName.includes(plFiles[i])) {
+                    currentIndex = i;
+                    break;
+                }
+            }
+        }
 
         var video = document.getElementById('video');
         var statusMsg = document.getElementById('status-msg');
-
-        if (directUrl) {
-            statusMsg.innerHTML = 'Прямой поток (короткое видео). Мгновенный запуск!';
-            video.src = decodeURIComponent(directUrl);
-            video.play().catch(e => { statusMsg.innerHTML = 'Поток готов. Нажмите Play для старта.'; });
-        } else if (Hls.isSupported() && streamUrl) {
-            var hls = new Hls({ maxBufferLength: 30, maxMaxBufferLength: 600, maxBufferHole: 0.5 });
-            hls.loadSource(decodeURIComponent(streamUrl)); hls.attachMedia(video);
-            hls.on(Hls.Events.MANIFEST_PARSED, function() { statusMsg.innerHTML = 'HLS Поток готов! Нажмите Play.'; });
-        } else if (video.canPlayType('application/vnd.apple.mpegurl') && streamUrl) {
-            video.src = decodeURIComponent(streamUrl);
-        }
-
         var wrapper = document.getElementById('player-wrapper');
         var playBtn = document.getElementById('play-pause-btn');
         var muteBtn = document.getElementById('mute-btn');
@@ -972,27 +1154,137 @@ PLAYER_HTML = """<!DOCTYPE html>
         var progressFill = document.getElementById('progress-fill');
         var timeDisplay = document.getElementById('time-display');
         var fullscreenBtn = document.getElementById('fullscreen-btn');
+        var loadingOverlay = document.getElementById('loading-overlay');
+        var progressBar = document.getElementById('progress-bar');
+        var statusText = document.getElementById('status-text');
 
-        if (plFiles.length > 1) {
-            document.getElementById('next-btn').style.display = 'block';
-            document.getElementById('playlist-toggle-btn').style.display = 'block';
-            let ul = document.getElementById('playlist-items');
-            for(let i = 0; i < plFiles.length; i++) {
-                let li = document.createElement('li');
-                li.className = 'pl-item' + (i === currentIndex ? ' active' : '');
-                li.innerText = plNames[i] || plFiles[i];
-                li.title = plNames[i] || plFiles[i];
-                li.onclick = () => playSpecificFile(i);
-                ul.appendChild(li);
+        function showStopNotification(message) {
+            const notification = document.createElement('div');
+            notification.className = 'stop-notification';
+            notification.innerHTML = '<i class="fas fa-stop-circle"></i> ' + message;
+            document.body.appendChild(notification);
+            setTimeout(() => notification.remove(), 2000);
+        }
+
+        async function fullStop() {
+            isLoadingVideo = false;
+            
+            if (currentHls) {
+                try {
+                    currentHls.destroy();
+                } catch(e) {}
+                currentHls = null;
+            }
+            
+            if (currentCheckInterval) {
+                clearInterval(currentCheckInterval);
+                currentCheckInterval = null;
+            }
+            
+            if (currentStreamId) {
+                try {
+                    await fetch('/stop/' + currentStreamId, { method: 'POST' });
+                    console.log('FFmpeg process stopped:', currentStreamId);
+                } catch(e) { console.log('Stop error:', e); }
+                currentStreamId = null;
+            }
+            
+            try {
+                video.pause();
+                video.src = '';
+                video.load();
+            } catch(e) {}
+        }
+
+        document.addEventListener('keydown', async function(e) {
+            if (e.code === 'Escape') {
+                e.preventDefault();
+                
+                let stopped = false;
+                
+                if (currentStreamId) {
+                    try {
+                        await fetch('/stop/' + currentStreamId, { method: 'POST' });
+                        showStopNotification('⏹️ FFmpeg процесс остановлен по ESC');
+                        stopped = true;
+                    } catch(err) {
+                        console.error('Stop error:', err);
+                    }
+                    
+                    if (currentCheckInterval) {
+                        clearInterval(currentCheckInterval);
+                        currentCheckInterval = null;
+                    }
+                    currentStreamId = null;
+                }
+                
+                if (loadingOverlay && loadingOverlay.classList.contains('active')) {
+                    loadingOverlay.classList.remove('active');
+                    isLoadingVideo = false;
+                    if (!stopped) showStopNotification('⏹️ Загрузка отменена по ESC');
+                    stopped = true;
+                }
+                
+                if (video && !video.paused) {
+                    video.pause();
+                    statusMsg.innerHTML = '⏸️ Видео приостановлено (ESC)';
+                    if (!stopped) showStopNotification('⏸️ Видео приостановлено');
+                    setTimeout(() => {
+                        if (statusMsg.innerHTML === '⏸️ Видео приостановлено (ESC)') {
+                            statusMsg.innerHTML = 'Нажмите Play для продолжения';
+                        }
+                    }, 2000);
+                    stopped = true;
+                }
+                
+                if (!stopped) {
+                    showStopNotification('ℹ️ Нет активной конвертации для остановки');
+                }
+            }
+        });
+
+        document.getElementById('cancel-loading').addEventListener('click', async () => {
+            await fullStop();
+            loadingOverlay.classList.remove('active');
+            statusMsg.innerHTML = 'Загрузка отменена. <a href="/" style="color:#2196f3;">Вернуться в галерею</a>';
+            showStopNotification('Загрузка отменена');
+        });
+
+        function initVideo(src, isHls = false) {
+            video.pause();
+            if (currentHls) {
+                currentHls.destroy();
+                currentHls = null;
+            }
+            
+            if (isHls && Hls.isSupported()) {
+                currentHls = new Hls({ maxBufferLength: 30, maxMaxBufferLength: 600, maxBufferHole: 0.5 });
+                currentHls.loadSource(src);
+                currentHls.attachMedia(video);
+                currentHls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    statusMsg.innerHTML = 'Поток готов. Нажмите Play.';
+                    video.play().catch(e => {});
+                });
+                currentHls.on(Hls.Events.ERROR, function(event, data) {
+                    if (data.fatal) {
+                        statusMsg.innerHTML = 'Ошибка HLS потока';
+                    }
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl') && isHls) {
+                video.src = src;
+            } else {
+                video.src = src;
+                video.play().catch(e => { statusMsg.innerHTML = 'Поток готов. Нажмите Play для старта.'; });
             }
         }
 
-        document.getElementById('playlist-toggle-btn').addEventListener('click', () => {
-            document.getElementById('playlist-sidebar').classList.add('active');
-        });
-        document.getElementById('close-sidebar-btn').addEventListener('click', () => {
-            document.getElementById('playlist-sidebar').classList.remove('active');
-        });
+        if (directUrl) {
+            statusMsg.innerHTML = 'Прямой поток. Мгновенный запуск!';
+            video.src = decodeURIComponent(directUrl);
+            video.play().catch(e => { statusMsg.innerHTML = 'Поток готов. Нажмите Play для старта.'; });
+        } else if (streamUrl) {
+            initVideo(decodeURIComponent(streamUrl), true);
+        }
 
         function formatTime(sec) {
             if (isNaN(sec)) return "00:00";
@@ -1013,6 +1305,12 @@ PLAYER_HTML = """<!DOCTYPE html>
         });
         video.addEventListener('click', togglePlay);
         playBtn.addEventListener('click', togglePlay);
+        video.addEventListener('waiting', () => { statusMsg.innerHTML = 'Буферизация...'; });
+        video.addEventListener('playing', () => { statusMsg.innerHTML = 'Воспроизведение'; });
+        video.addEventListener('error', (e) => { 
+            statusMsg.innerHTML = 'Ошибка воспроизведения видео';
+            console.error('Video error:', e);
+        });
 
         volSlider.addEventListener('input', function() {
             video.volume = this.value; video.muted = (this.value == 0);
@@ -1025,7 +1323,6 @@ PLAYER_HTML = """<!DOCTYPE html>
             muteBtn.innerHTML = video.muted ? '<i class="fas fa-volume-mute"></i>' : '<i class="fas fa-volume-up"></i>';
         });
 
-        // Кроссбраузерный полноэкранный режим
         fullscreenBtn.addEventListener('click', function() {
             if (!document.fullscreenElement && !document.webkitFullscreenElement && !document.mozFullScreenElement && !document.msFullscreenElement) {
                 if (wrapper.requestFullscreen) { wrapper.requestFullscreen(); }
@@ -1052,47 +1349,165 @@ PLAYER_HTML = """<!DOCTYPE html>
         });
         
         video.addEventListener('ended', function() {
-            if (plFiles.length > 0 && currentIndex >= 0 && currentIndex < plFiles.length - 1) playNextInPlaylist();
+            if (plFiles.length > 0 && currentIndex >= 0 && currentIndex < plFiles.length - 1) {
+                playSpecificFile(currentIndex + 1);
+            }
         });
 
-        function playNextInPlaylist() {
-            if (currentIndex < 0 || currentIndex >= plFiles.length - 1) return;
-            playSpecificFile(currentIndex + 1);
-        }
+        document.getElementById('next-btn').addEventListener('click', () => {
+            if (currentIndex >= 0 && currentIndex < plFiles.length - 1) {
+                playSpecificFile(currentIndex + 1);
+            }
+        });
 
-        document.getElementById('next-btn').addEventListener('click', playNextInPlaylist);
-
-        function playSpecificFile(index) {
+        async function playSpecificFile(index) {
+            if (isLoadingVideo) {
+                statusMsg.innerHTML = 'Уже загружается...';
+                return;
+            }
+            
             if (index < 0 || index >= plFiles.length) return;
+            
+            await fullStop();
+            
+            currentIndex = index;
             var nextFile = plFiles[index];
+            var nextName = plNames[index] || nextFile;
+            
             sessionStorage.setItem('ofavi_current_file', nextFile);
+            sessionStorage.setItem('ofavi_playlist_files', JSON.stringify(plFiles));
+            sessionStorage.setItem('ofavi_playlist_names', JSON.stringify(plNames));
             
-            document.getElementById('loading-overlay').classList.add('active');
-            document.getElementById('progress-bar').style.width = '25%';
-            if(video.play) video.pause();
+            document.querySelectorAll('.pl-item').forEach((item, i) => {
+                if (i === index) item.classList.add('active');
+                else item.classList.remove('active');
+            });
             
-            fetch('/prepare/' + nextFile, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ quality: currentQuality, fps: '' })
-            }).then(r => r.json()).then(data => {
+            isLoadingVideo = true;
+            loadingOverlay.classList.add('active');
+            progressBar.style.width = '15%';
+            statusText.textContent = 'Анализ медиапотока...';
+            statusMsg.innerHTML = 'Подготовка видео: ' + nextName;
+            
+            try {
+                const startRes = await fetch('/prepare/' + encodeURIComponent(nextFile), { 
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ quality: currentQuality, fps: '' })
+                });
+                const data = await startRes.json();
+                
                 if (data.status === 'direct') {
-                    document.getElementById('progress-bar').style.width = '100%';
-                    window.location.href = "/player?direct=" + encodeURIComponent(data.direct_url) + "&quality=" + currentQuality + "&file=" + encodeURIComponent(nextFile);
+                    progressBar.style.width = '100%';
+                    statusText.textContent = 'Прямой запуск...';
+                    setTimeout(() => {
+                        loadingOverlay.classList.remove('active');
+                        isLoadingVideo = false;
+                        video.src = decodeURIComponent(data.direct_url);
+                        video.play().catch(e => {});
+                        statusMsg.innerHTML = 'Воспроизведение: ' + nextName;
+                    }, 300);
                     return;
                 }
                 
-                document.getElementById('progress-bar').style.width = '60%';
-                var checkInterval = setInterval(function() {
-                    fetch('/status/' + data.stream_id).then(r => r.json()).then(st => {
-                        if(st.ready) {
-                            clearInterval(checkInterval);
-                            document.getElementById('progress-bar').style.width = '100%';
-                            window.location.href = "/player?stream=" + encodeURIComponent("/stream/" + data.stream_id + "/index.m3u8") + "&quality=" + currentQuality + "&file=" + encodeURIComponent(nextFile);
+                if (data.cached) {
+                    progressBar.style.width = '100%';
+                    statusText.textContent = 'Загружено из кеша!';
+                    setTimeout(() => {
+                        loadingOverlay.classList.remove('active');
+                        isLoadingVideo = false;
+                        initVideo('/stream/' + data.stream_id + '/index.m3u8', true);
+                        statusMsg.innerHTML = 'Воспроизведение: ' + nextName;
+                    }, 500);
+                    return;
+                }
+                
+                currentStreamId = data.stream_id;
+                progressBar.style.width = '40%';
+                statusText.textContent = 'Рендеринг потока...';
+                
+                let checkCount = 0;
+                currentCheckInterval = setInterval(async () => {
+                    checkCount++;
+                    try {
+                        const statusRes = await fetch('/status/' + currentStreamId);
+                        const st = await statusRes.json();
+                        
+                        if (progressBar.style.width !== '100%') {
+                            let newWidth = 40 + Math.min(55, checkCount * 2);
+                            progressBar.style.width = newWidth + '%';
                         }
-                    });
+                        
+                        if (st.ready) {
+                            clearInterval(currentCheckInterval);
+                            currentCheckInterval = null;
+                            progressBar.style.width = '100%';
+                            statusText.textContent = 'Готово! Запуск плеера...';
+                            setTimeout(() => {
+                                loadingOverlay.classList.remove('active');
+                                isLoadingVideo = false;
+                                initVideo('/stream/' + currentStreamId + '/index.m3u8', true);
+                                statusMsg.innerHTML = 'Воспроизведение: ' + nextName;
+                                currentStreamId = null;
+                            }, 300);
+                        } else if (checkCount > 180) {
+                            clearInterval(currentCheckInterval);
+                            currentCheckInterval = null;
+                            statusText.textContent = 'Ошибка: таймаут конвертации';
+                            statusText.style.color = '#f44336';
+                            setTimeout(() => {
+                                loadingOverlay.classList.remove('active');
+                                isLoadingVideo = false;
+                                statusMsg.innerHTML = 'Ошибка подготовки видео';
+                            }, 2000);
+                        }
+                    } catch(e) {
+                        console.error('Status check error:', e);
+                    }
                 }, 2000);
-            });
+                
+            } catch (e) {
+                console.error('Fetch error:', e);
+                statusText.textContent = 'Ошибка сервера: ' + e.message;
+                statusText.style.color = '#f44336';
+                setTimeout(() => {
+                    loadingOverlay.classList.remove('active');
+                    isLoadingVideo = false;
+                    statusMsg.innerHTML = 'Ошибка подключения к серверу';
+                }, 2000);
+            }
         }
+
+        function buildPlaylistSidebar() {
+            if (plFiles.length > 1) {
+                document.getElementById('next-btn').style.display = 'block';
+                document.getElementById('playlist-toggle-btn').style.display = 'block';
+                let ul = document.getElementById('playlist-items');
+                ul.innerHTML = '';
+                for(let i = 0; i < plFiles.length; i++) {
+                    let li = document.createElement('li');
+                    li.className = 'pl-item' + (i === currentIndex ? ' active' : '');
+                    li.innerText = plNames[i] || plFiles[i];
+                    li.title = plNames[i] || plFiles[i];
+                    li.onclick = () => playSpecificFile(i);
+                    ul.appendChild(li);
+                }
+            }
+        }
+        
+        buildPlaylistSidebar();
+
+        document.getElementById('playlist-toggle-btn').addEventListener('click', () => {
+            document.getElementById('playlist-sidebar').classList.add('active');
+        });
+        document.getElementById('close-sidebar-btn').addEventListener('click', () => {
+            document.getElementById('playlist-sidebar').classList.remove('active');
+        });
+
+        window.addEventListener('beforeunload', () => {
+            if (currentStreamId) {
+                navigator.sendBeacon('/stop/' + currentStreamId);
+            }
+        });
 
         document.addEventListener('keydown', function(e) {
             if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
@@ -1108,6 +1523,9 @@ PLAYER_HTML = """<!DOCTYPE html>
             if (!video.paused) hideControlsTimer = setTimeout(() => wrapper.classList.add('idle'), 2500);
         }
         wrapper.addEventListener('mousemove', resetActivity);
+        wrapper.addEventListener('mouseleave', () => {
+            if (!video.paused) wrapper.classList.add('idle');
+        });
     </script>
 </body>
 </html>"""
@@ -1115,6 +1533,469 @@ PLAYER_HTML = """<!DOCTYPE html>
 @app.route('/player')
 def serve_player():
     return render_template_string(PLAYER_HTML)
+
+# ==========================================
+# ДОП. МАРШРУТЫ: ПЛЕЕР И ПЛЕЙЛИСТЫ ДЛЯ LITE-РЕЖИМА (С FPS)
+# ==========================================
+@app.route('/lite_playlist')
+def lite_playlist():
+    file = request.args.get('file', '')
+    target_path = get_secure_path(file)
+    if not target_path or not os.path.exists(target_path):
+        return "Плейлист не найден", 404
+        
+    try:
+        with open(target_path, 'r', encoding='utf-8') as f:
+            pl_data = json.load(f)
+    except:
+        pl_data = {"files": [], "names": []}
+        
+    html = f"""
+    <html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><title>Плейлист (Lite)</title></head>
+    <body style='background:#111; color:#eee; font-family:sans-serif; margin:15px;'>
+    <h2 style="color:#4caf50; margin-top:5px; word-break:break-word;">📑 {urllib.parse.unquote(file)}</h2>
+    
+    <div style="background:#222; padding:10px; border-radius:5px; margin-bottom:15px;">
+        <a href='/?lite=1' style='color:#ffca28; text-decoration:none;'>⬅ Назад в галерею</a>
+    </div>
+    
+    <ul style="list-style:none; padding:0; line-height:1.8; font-size:16px;">
+    """
+    
+    files_list = pl_data.get('files', [])
+    names_list = pl_data.get('names', [])
+    
+    for i in range(len(files_list)):
+        sf = files_list[i]
+        nm = names_list[i] if i < len(names_list) else sf
+        safe_sf = urllib.parse.quote(sf)
+        html += f"<li style='margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #333;'><a href='/lite_player?file={safe_sf}' style='color:#64b5f6; text-decoration:none; display:block;'>🎬 {nm}</a></li>"
+        
+    if not files_list:
+        html += "<li style='color:#888;'>Плейлист пуст</li>"
+        
+    html += "</ul></body></html>"
+    return render_template_string(html)
+
+@app.route('/lite_player')
+def lite_player():
+    file = request.args.get('file', '')
+    safe_js_file = file.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
+    
+    html = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Выбор качества (Lite)</title>
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+        <style>
+            body {{ background:#111; color:#fff; text-align:center; padding-top:20px; font-family:sans-serif; }}
+            .fps-input-group {{ margin: 15px auto; width: 90%; max-width: 300px; }}
+            .fps-input-group input {{ width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #444; background: #222; color: white; font-size: 16px; box-sizing: border-box; text-align: center; }}
+            .quality-btn {{ display:block; width:90%; max-width:400px; margin:10px auto; padding:15px; border-radius:8px; font-size:16px; cursor:pointer; border: none; transition: 0.2s; }}
+            .retro-btn {{ background:#607d8b; color:#fff; }}
+            .retro-btn:hover {{ background:#78909c; }}
+            .low-btn {{ background:#4caf50; color:#fff; }}
+            .low-btn:hover {{ background:#66bb6a; }}
+            .medium-btn {{ background:#ff9800; color:#fff; }}
+            .medium-btn:hover {{ background:#ffb74d; }}
+            .cinema-btn {{ background:#9c27b0; color:#fff; }}
+            .cinema-btn:hover {{ background:#ba68c8; }}
+            .high-btn {{ background:#f44336; color:#fff; }}
+            .high-btn:hover {{ background:#e57373; }}
+            .back-btn {{ background:transparent; color:#888; border:1px solid #444; border-radius:5px; padding:10px 15px; margin-top:20px; cursor:pointer; }}
+            .back-btn:hover {{ background:#444; color:#fff; }}
+            #loading {{ display:none; margin-top:50px; }}
+            .status-text {{ color:#ffca28; font-size:18px; margin-top:20px; }}
+            .loader {{ font-size: 50px; display: inline-block; animation: spin 2s linear infinite; }}
+            @keyframes spin {{ 100% {{ transform: rotate(360deg); }} }}
+            #cancel-btn {{ margin-top: 20px; background: #f44336; border: none; color: white; padding: 10px 20px; border-radius: 20px; cursor: pointer; font-size: 14px; }}
+            #cancel-btn:hover {{ background: #d32f2f; }}
+            
+            @keyframes fadeOut {{
+                0% {{ opacity: 1; transform: translateY(0); }}
+                70% {{ opacity: 1; transform: translateY(0); }}
+                100% {{ opacity: 0; transform: translateY(-20px); }}
+            }}
+            .stop-notification {{
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                background: #f44336;
+                color: white;
+                padding: 12px 24px;
+                border-radius: 8px;
+                z-index: 10000;
+                animation: fadeOut 2s ease-out forwards;
+                font-size: 14px;
+                font-weight: bold;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            }}
+        </style>
+    </head>
+    <body>
+    
+    <div id="menu">
+        <h3 style="color:#2196f3; padding: 0 10px; word-break: break-word;">🎬 {urllib.parse.unquote(file)}</h3>
+        <p style="color:#bbb; margin-bottom: 20px;">Выберите качество:</p>
+        
+        <div class="fps-input-group">
+            <label style="color:#bbb;"><i class="fas fa-tachometer-alt"></i> FPS (оставьте пустым для исходного):</label>
+            <input type="number" id="lite-fps-input" placeholder="Напр. 24, 30, 60">
+        </div>
+        
+        <button class="quality-btn retro-btn" onclick="startProcessing('mpeg1')">📺 Ретро (MPEG1 480p)</button>
+        <button class="quality-btn low-btn" onclick="startProcessing('low')">📱 Слабый (360p)</button>
+        <button class="quality-btn medium-btn" onclick="startProcessing('medium')">💻 Средний (720p)</button>
+        <button class="quality-btn cinema-btn" onclick="startProcessing('cinema')">🍿 Кино (720p HQ)</button>
+        <button class="quality-btn high-btn" onclick="startProcessing('high')">🔥 Высокий (Исходное)</button>
+        
+        <br>
+        <button class="back-btn" onclick="window.history.back()">⬅ Назад</button>
+    </div>
+
+    <div id="loading">
+        <div class="loader">⏳</div>
+        <h3 style="color:#2196f3;">Подготовка видео...</h3>
+        <p id="status" class="status-text">Отправка запроса на сервер...</p>
+        <button id="cancel-btn">Отменить</button>
+        <br><button class="back-btn" onclick="window.location.reload()">Перезагрузить</button>
+    </div>
+
+    <script>
+        let currentStreamId = null;
+        let currentCheckInterval = null;
+        let isProcessing = false;
+        
+        function showStopNotification(message) {{
+            const notification = document.createElement('div');
+            notification.className = 'stop-notification';
+            notification.innerHTML = '<i class="fas fa-stop-circle"></i> ' + message;
+            document.body.appendChild(notification);
+            setTimeout(() => notification.remove(), 2000);
+        }}
+        
+        function startProcessing(quality) {{
+            if (isProcessing) return;
+            isProcessing = true;
+            
+            document.getElementById("menu").style.display = "none";
+            document.getElementById("loading").style.display = "block";
+            
+            var file = "{safe_js_file}";
+            var fpsValue = document.getElementById('lite-fps-input').value;
+            
+            var xhr = new XMLHttpRequest();
+            xhr.open("POST", "/prepare/" + file, true);
+            xhr.setRequestHeader("Content-Type", "application/json");
+            
+            xhr.onreadystatechange = function() {{
+                if (xhr.readyState === 4) {{
+                    if (xhr.status === 200) {{
+                        try {{
+                            var data = JSON.parse(xhr.responseText);
+                            if (data.status === 'direct') {{
+                                window.location.href = "/direct/" + encodeURIComponent(file);
+                            }} else if (data.cached) {{
+                                document.getElementById("status").innerText = "✅ Найдено в кеше! Запуск...";
+                                setTimeout(function() {{ 
+                                    window.location.href = "/lite_video?stream=" + data.stream_id; 
+                                }}, 500);
+                            }} else {{
+                                document.getElementById("status").innerText = "🔄 Рендеринг потока. Ожидание...";
+                                currentStreamId = data.stream_id;
+                                currentCheckInterval = setInterval(function() {{
+                                    var xhr2 = new XMLHttpRequest();
+                                    xhr2.open("GET", "/status/" + currentStreamId, true);
+                                    xhr2.onreadystatechange = function() {{
+                                        if (xhr2.readyState === 4 && xhr2.status === 200) {{
+                                            var st = JSON.parse(xhr2.responseText);
+                                            if (st.ready) {{
+                                                clearInterval(currentCheckInterval);
+                                                currentCheckInterval = null;
+                                                document.getElementById("status").innerText = "✅ Готово! Запуск...";
+                                                window.location.href = "/lite_video?stream=" + currentStreamId;
+                                            }}
+                                        }}
+                                    }};
+                                    xhr2.send();
+                                }}, 2000);
+                            }}
+                        }} catch (e) {{
+                            document.getElementById("status").innerText = "❌ Ошибка: " + e.message;
+                            document.getElementById("status").style.color = "#f44336";
+                            isProcessing = false;
+                        }}
+                    }} else {{
+                        document.getElementById("status").innerText = "❌ Ошибка сервера: " + xhr.status;
+                        document.getElementById("status").style.color = "#f44336";
+                        isProcessing = false;
+                    }}
+                }}
+            }};
+            
+            xhr.send(JSON.stringify({{quality: quality, fps: fpsValue}}));
+        }}
+        
+        document.getElementById('cancel-btn').addEventListener('click', async function() {{
+            if (currentStreamId) {{
+                try {{
+                    await fetch('/stop/' + currentStreamId, {{ method: 'POST' }});
+                    showStopNotification('⏹️ Конвертация остановлена');
+                }} catch(e) {{}}
+            }}
+            if (currentCheckInterval) clearInterval(currentCheckInterval);
+            isProcessing = false;
+            window.location.reload();
+        }});
+        
+        document.addEventListener('keydown', async function(e) {{
+            if (e.code === 'Escape') {{
+                e.preventDefault();
+                if (currentStreamId) {{
+                    try {{
+                        await fetch('/stop/' + currentStreamId, {{ method: 'POST' }});
+                        showStopNotification('⏹️ FFmpeg остановлен по ESC');
+                    }} catch(e) {{}}
+                    if (currentCheckInterval) clearInterval(currentCheckInterval);
+                    isProcessing = false;
+                    window.location.reload();
+                }}
+            }}
+        }});
+        
+        window.addEventListener('beforeunload', function() {{
+            if (currentStreamId) {{
+                navigator.sendBeacon('/stop/' + currentStreamId);
+            }}
+        }});
+    </script>
+    </body></html>
+    """
+    return render_template_string(html)
+
+@app.route('/lite_video')
+def lite_video():
+    stream_id = request.args.get('stream', '')
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <title>AVI Player Lite</title>
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+        <style>
+            body {{
+                background: #000;
+                margin: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                flex-direction: column;
+                font-family: sans-serif;
+            }}
+            .video-container {{
+                position: relative;
+                width: 100%;
+                max-width: 100%;
+                background: #000;
+            }}
+            video {{
+                width: 100%;
+                height: auto;
+                max-height: 90vh;
+                object-fit: contain;
+            }}
+            .controls {{
+                position: fixed;
+                bottom: 20px;
+                left: 0;
+                right: 0;
+                display: flex;
+                justify-content: center;
+                gap: 15px;
+                padding: 10px;
+                background: rgba(0,0,0,0.7);
+                z-index: 100;
+            }}
+            button {{
+                background: #2196f3;
+                border: none;
+                color: white;
+                padding: 12px 24px;
+                border-radius: 30px;
+                font-size: 16px;
+                cursor: pointer;
+                transition: 0.2s;
+            }}
+            button:hover {{
+                background: #1976d2;
+                transform: scale(1.05);
+            }}
+            .back-btn {{
+                position: fixed;
+                top: 15px;
+                left: 15px;
+                background: rgba(0,0,0,0.6);
+                padding: 10px 15px;
+                border-radius: 20px;
+                color: white;
+                text-decoration: none;
+                z-index: 100;
+                font-size: 14px;
+            }}
+            .back-btn:hover {{
+                background: rgba(0,0,0,0.8);
+            }}
+            .status {{
+                position: fixed;
+                bottom: 100px;
+                left: 0;
+                right: 0;
+                text-align: center;
+                color: #ff9800;
+                font-size: 14px;
+                padding: 10px;
+                background: rgba(0,0,0,0.5);
+                z-index: 100;
+            }}
+            .error {{
+                color: #f44336;
+            }}
+        </style>
+    </head>
+    <body>
+        <a href="javascript:history.back()" class="back-btn">← Назад</a>
+        
+        <div class="video-container">
+            <video id="video" controls playsinline></video>
+        </div>
+        
+        <div class="controls">
+            <button id="play-btn">▶ Воспроизвести</button>
+        </div>
+        <div id="status" class="status">⏳ Загрузка видео...</div>
+
+        <script>
+            var video = document.getElementById('video');
+            var playBtn = document.getElementById('play-btn');
+            var statusDiv = document.getElementById('status');
+            var streamId = "{stream_id}";
+            var videoUrl = "/stream/" + streamId + "/index.m3u8";
+            var hls = null;
+            var retryCount = 0;
+            
+            function showStatus(msg, isError) {{
+                statusDiv.innerHTML = msg;
+                if (isError) {{
+                    statusDiv.classList.add('error');
+                }} else {{
+                    statusDiv.classList.remove('error');
+                }}
+            }}
+            
+            function initVideo() {{
+                showStatus('🔄 Загрузка потока...');
+                
+                if (Hls.isSupported()) {{
+                    if (hls) {{
+                        hls.destroy();
+                    }}
+                    hls = new Hls({{
+                        debug: false,
+                        enableWorker: true,
+                        lowLatencyMode: true,
+                        maxBufferLength: 30
+                    }});
+                    hls.loadSource(videoUrl);
+                    hls.attachMedia(video);
+                    
+                    hls.on(Hls.Events.MANIFEST_PARSED, function() {{
+                        showStatus('✅ Готово! Нажмите Play');
+                        video.play().then(() => {{
+                            showStatus('▶ Воспроизведение');
+                        }}).catch(e => {{
+                            showStatus('ℹ️ Нажмите Play для начала', false);
+                        }});
+                    }});
+                    
+                    hls.on(Hls.Events.ERROR, function(event, data) {{
+                        if (data.fatal) {{
+                            switch(data.type) {{
+                                case Hls.ErrorTypes.NETWORK_ERROR:
+                                    if (retryCount < 3) {{
+                                        retryCount++;
+                                        showStatus('⚠️ Ошибка сети. Переподключение... (' + retryCount + '/3)');
+                                        setTimeout(() => initVideo(), 2000);
+                                    }} else {{
+                                        showStatus('❌ Не удалось загрузить видео. Проверьте соединение.', true);
+                                    }}
+                                    break;
+                                default:
+                                    showStatus('❌ Ошибка воспроизведения', true);
+                                    break;
+                            }}
+                        }}
+                    }});
+                }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
+                    video.src = videoUrl;
+                    video.addEventListener('loadedmetadata', function() {{
+                        showStatus('✅ Готово! Нажмите Play');
+                    }});
+                }} else {{
+                    showStatus('❌ Ваш браузер не поддерживает HLS поток', true);
+                }}
+            }}
+            
+            playBtn.addEventListener('click', function() {{
+                video.play()
+                    .then(() => {{
+                        showStatus('▶ Воспроизведение');
+                    }})
+                    .catch(e => {{
+                        console.error('Play error:', e);
+                        showStatus('⚠️ Нажмите еще раз для воспроизведения', false);
+                    }});
+            }});
+            
+            video.addEventListener('playing', function() {{
+                showStatus('▶ Воспроизведение');
+            }});
+            
+            video.addEventListener('pause', function() {{
+                showStatus('⏸ Пауза');
+            }});
+            
+            video.addEventListener('waiting', function() {{
+                showStatus('⏳ Буферизация...');
+            }});
+            
+            video.addEventListener('error', function(e) {{
+                console.error('Video error:', e);
+                showStatus('❌ Ошибка видео', true);
+            }});
+            
+            video.addEventListener('canplay', function() {{
+                if (video.readyState >= 3) {{
+                    showStatus('✅ Готово к воспроизведению');
+                }}
+            }});
+            
+            initVideo();
+            
+            window.addEventListener('beforeunload', function() {{
+                if (streamId) {{
+                    navigator.sendBeacon('/stop/' + streamId);
+                }}
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
 # ==========================================
 # 3. МАРШРУТ: ГЕНЕРАЦИЯ ПРЕВЬЮ (THUMBNAIL)
@@ -1136,12 +2017,10 @@ def get_thumbnail(filename):
     return send_from_directory(THUMB_DIR, f"{file_hash}.jpg") if os.path.exists(thumb_path) else ("Failed", 404)
 
 # ==========================================
-# 4. МАРШРУТ: ПОДГОТОВКА С ПРОВЕРКОЙ НА КРАТКОСТЬ (УМНЫЙ ПОТОК)
+# 4. МАРШРУТ: ПОДГОТОВКА С УМНЫМ КЕШЕМ И ОСТАНОВКОЙ
 # ==========================================
 @app.route('/prepare/<path:filename>', methods=['POST'])
 def prepare_video(filename):
-    global current_ffmpeg_process
-    
     video_path = get_secure_path(filename)
     if not video_path: return "Access Denied", 403
     
@@ -1182,35 +2061,44 @@ def prepare_video(filename):
     os.makedirs(stream_dir, exist_ok=True)
     m3u8_file = os.path.join(stream_dir, 'index.m3u8')
 
-    if not os.path.exists(m3u8_file):
-        if current_ffmpeg_process is not None:
-            try:
-                current_ffmpeg_process.terminate()
-                current_ffmpeg_process.wait(timeout=2)
-            except Exception:
-                try: current_ffmpeg_process.kill() 
-                except: pass
+    is_fully_cached = False
+    if os.path.exists(m3u8_file):
+        try:
+            with open(m3u8_file, 'r', encoding='utf-8') as f:
+                if '#EXT-X-ENDLIST' in f.read():
+                    is_fully_cached = True
+        except: pass
 
+    if not is_fully_cached:
+        kill_ffmpeg_processes(stream_id)
+        
         total_cores = os.cpu_count() or 4
         threads_to_use = max(1, int(total_cores * 0.75))
         
-        command = ['ffmpeg', '-i', video_path, '-c:v', 'libx264', '-g', '50', '-keyint_min', '50', '-sc_threshold', '0', '-threads', str(threads_to_use)]
+        command = ['ffmpeg', '-i', video_path, '-g', '50', '-keyint_min', '50', '-sc_threshold', '0', '-threads', str(threads_to_use)]
         if fps and fps.isdigit(): command.extend(['-r', fps])
 
-        if quality == 'low': command.extend(['-preset', 'ultrafast', '-vf', 'scale=-2:360', '-crf', '32', '-maxrate', '400k', '-bufsize', '800k', '-c:a', 'aac', '-b:a', '64k'])
-        elif quality == 'high': command.extend(['-preset', 'ultrafast', '-crf', '23', '-maxrate', '5000k', '-bufsize', '10000k', '-c:a', 'aac', '-b:a', '192k'])
-        elif quality == 'cinema': command.extend(['-preset', 'medium', '-vf', 'scale=-2:720', '-crf', '24', '-maxrate', '2500k', '-bufsize', '5000k', '-c:a', 'aac', '-b:a', '192k'])
-        else: command.extend(['-preset', 'ultrafast', '-vf', 'scale=-2:720', '-crf', '28', '-maxrate', '1500k', '-bufsize', '3000k', '-c:a', 'aac', '-b:a', '128k'])
+        if quality == 'mpeg1':
+            command.extend(['-c:v', 'mpeg1video', '-vf', 'scale=-2:480', '-b:v', '800k', '-c:a', 'mp2', '-b:a', '128k'])
+        else:
+            command.extend(['-c:v', 'libx264'])
+            if quality == 'low': command.extend(['-preset', 'ultrafast', '-vf', 'scale=-2:360', '-crf', '32', '-maxrate', '400k', '-bufsize', '800k', '-c:a', 'aac', '-b:a', '64k'])
+            elif quality == 'high': command.extend(['-preset', 'ultrafast', '-crf', '23', '-maxrate', '5000k', '-bufsize', '10000k', '-c:a', 'aac', '-b:a', '192k'])
+            elif quality == 'cinema': command.extend(['-preset', 'medium', '-vf', 'scale=-2:720', '-crf', '24', '-maxrate', '2500k', '-bufsize', '5000k', '-c:a', 'aac', '-b:a', '192k'])
+            else: command.extend(['-preset', 'ultrafast', '-vf', 'scale=-2:720', '-crf', '28', '-maxrate', '1500k', '-bufsize', '3000k', '-c:a', 'aac', '-b:a', '128k'])
 
         command.extend(['-start_number', '0', '-hls_time', '5', '-hls_list_size', '0', '-hls_playlist_type', 'event', '-f', 'hls', m3u8_file])
         
-        print(f"Запуск FFmpeg HLS: {quality} | Выделено ядер: {threads_to_use}")
-        current_ffmpeg_process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"🎬 Запуск FFmpeg HLS: {quality} | FPS: {fps if fps else 'auto'} | ID: {stream_id}")
+        proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-    return jsonify({"status": "processing", "stream_id": stream_id})
+        with ffmpeg_lock:
+            ffmpeg_processes[stream_id] = proc
+            
+    return jsonify({"status": "processing", "stream_id": stream_id, "cached": is_fully_cached})
 
 # ==========================================
-# 5. МАРШРУТ: ОТДАЧА ПРЯМОГО СТРИМА
+# 5. МАРШРУТ: ОТДАЧА СТРИМОВ И ИСПРАВЛЕНИЕ КЕШИРОВАНИЯ
 # ==========================================
 @app.route('/direct/<path:filename>')
 def serve_direct(filename):
@@ -1225,8 +2113,22 @@ def check_status(stream_id):
 
 @app.route('/stream/<stream_id>/<path:file>')
 def serve_hls(stream_id, file):
-    return send_from_directory(os.path.join(HLS_CACHE, stream_id), file)
+    response = make_response(send_from_directory(os.path.join(HLS_CACHE, stream_id), file))
+    
+    if file.endswith('.m3u8'):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '-1'
+    else:
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        
+    return response
 
 if __name__ == '__main__':
-    print(f"🚀 [On-Premise Ultimate V3] AVI Media Core запущен на порту {PORT}!")
+    print(f"🚀 [On-Premise Ultimate V3.6] AVI Media Core запущен на порту {PORT}!")
+    print(f"   📁 Медиа папка: {FOLDER}")
+    print(f"   🛑 API остановки: /stop/<stream_id> | /stop_all")
+    print(f"   🪟 Поддержка Windows: taskkill /F /IM ffmpeg.exe")
+    print(f"   🌐 Основной интерфейс: http://localhost:{PORT}/")
+    print(f"   📱 Lite режим: http://localhost:{PORT}/?lite=1")
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
