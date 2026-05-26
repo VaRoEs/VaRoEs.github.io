@@ -1,7 +1,7 @@
 # AVI Media Core 📺
 
 **Your own sovereign, minimalist media streaming infrastructure.**
-WORK ON WINDOWS 7!
+WORK ON WINDOWS 7! About exe file.
 AVI Media Core is a "YouTube for the minimalist." It is a lightweight, self-hosted media streaming solution designed for performance, portability, and sovereignty. No bloated databases, no heavy dependencies, no corporate tracking — just pure, efficient streaming.
 
 ### ⚡ Why?
